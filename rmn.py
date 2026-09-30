@@ -28,6 +28,7 @@ class Net:
         self.use_halt = use_halt
         self.rng = np.random.default_rng(seed)
         self.T = T
+        self.T_out = None                          # separate temperature for output/halt units
         self.n_in, self.n_out = 11, 10            # inputs: digits 0-9 + "done"
         self.inputs = list(range(self.n_in))
         k = self.n_in
@@ -69,8 +70,12 @@ class Net:
                    for s in grp]
             self.order += [grp[i] for i in np.argsort(eff)[::-1]]
 
+    def T_of(self, s):
+        is_unit = s >= self.outputs[0]
+        return self.T_out if (is_unit and self.T_out is not None) else self.T
+
     def _p(self, total, s):
-        return 1 / (1 + np.exp(-(total - self.th[:, s]) / self.T))
+        return 1 / (1 + np.exp(-(total - self.th[:, s]) / self.T_of(s)))
 
     def run(self, seq, greedy=False, grads=None):
         """Run one episode. Returns list of per-output-tick exact-correctness.
@@ -85,6 +90,7 @@ class Net:
         if self.use_halt:
             schedule.append((None, True, "halt"))
         correct = []
+        self.disc = []
 
         def credit(ids, r):
             if grads is None or not ids:
@@ -92,7 +98,7 @@ class Net:
             share = r / len(ids)
             for eid in ids:
                 g, s, snap, p, fired = events[eid]
-                coef = share * (fired - p) / T
+                coef = share * (fired - p) / self.T_of(s)
                 grads[0][g, s] += coef * snap
                 grads[1][g, s] -= coef
 
@@ -143,6 +149,10 @@ class Net:
             active = {u for u in self.outputs + ([self.halt] if self.use_halt else []) if act[u] > 0}
             if done:
                 correct.append(active == want)
+                if isinstance(target, (int, np.integer)):   # target digit fired minus any wrong digit fired
+                    others = [u for u in self.outputs if u != self.outputs[target]]
+                    self.disc.append(float(self.outputs[target] in active)
+                                     - float(any(u in active for u in others)))
             if not done:                           # only judge outputs in the output phase
                 continue
             for u in active:
@@ -189,3 +199,30 @@ if __name__ == "__main__":
     net = Net(seed=0)
     stages = [(1, 2), (1, 4), (1, 10), (2, 10), (3, 10)]
     train(net, stages)
+
+
+def train_adaptive(net, length, alpha, T_out=None, T_hi=2.0, T_lo=0.3, lr_hi=0.3, lr_lo=0.01,
+                   s_ref=0.2, ema=0.02, batch=8, max_eps=20000, check=2000, log=print, seed=1):
+    """High chaos + high learning rate until something starts returning the right digit;
+    then both fall with the moving success rate s (saturating at s_ref)."""
+    rng = np.random.default_rng(seed)
+    s = 0.0
+    for ep in range(0, max_eps, batch):
+        sat = min(1.0, s / s_ref)
+        net.T = T_hi + (T_lo - T_hi) * sat
+        net.T_out = T_out
+        lr = lr_hi + (lr_lo - lr_hi) * sat
+        dW, dth = np.zeros_like(net.W), np.zeros_like(net.th)
+        for _ in range(batch):
+            seq = list(rng.integers(0, alpha, length))
+            net.run(seq, grads=(dW, dth))
+            s += ema * (max(0.0, float(np.mean(net.disc))) - s)
+        net.W = np.clip(net.W + lr * dW / batch, -2, 2)
+        net.th = np.clip(net.th + lr * dth / batch, 0.2, 4.0)
+        if (ep + batch) % check == 0:
+            net._update_callorder()
+            T_save, net.T = net.T, T_lo
+            acc = evaluate(net, length, alpha)
+            net.T = T_save
+            log(f"eps={ep + batch} s={s:.2f} T={net.T:.2f} lr={lr:.3f} greedy={acc:.2f}")
+    return net
