@@ -23,9 +23,11 @@ class Net:
     """
 
     def __init__(self, n_clusters=4, cluster_size=10, n_bridge=8, inter=0.1,
-                 T=0.4, seed=0, th0=1.5, use_halt=True):
+                 T=0.4, seed=0, th0=1.5, use_halt=True, slack=1, partial=0.3):
         assert 5 <= n_bridge <= 10
         self.use_halt = use_halt
+        self.slack = slack                         # extra output ticks with no fixed target
+        self.partial = partial                     # credit for a digit from the sequence firing off-target
         self.rng = np.random.default_rng(seed)
         self.T = T
         self.T_out = None                          # separate temperature for output/halt units
@@ -89,6 +91,7 @@ class Net:
         schedule += [(None, True, seq[j]) for j in range(n)]
         if self.use_halt:
             schedule.append((None, True, "halt"))
+        schedule += [(None, True, "slack")] * self.slack
         correct = []
         self.disc = []
 
@@ -140,14 +143,14 @@ class Net:
                         wtags[s] = (tags[s] | {eid}) if act[s] > 0 else EMPTY
                     dirty = True
             # judge outputs this tick
-            if target is None:
+            if target is None or target == "slack":
                 want = set()
             elif target == "halt":
                 want = {self.halt}
             else:
                 want = {self.outputs[target]}
             active = {u for u in self.outputs + ([self.halt] if self.use_halt else []) if act[u] > 0}
-            if done:
+            if done and target != "slack":
                 correct.append(active == want)
                 if isinstance(target, (int, np.integer)):   # target digit fired minus any wrong digit fired
                     others = [u for u in self.outputs if u != self.outputs[target]]
@@ -155,8 +158,15 @@ class Net:
                                      - float(any(u in active for u in others)))
             if not done:                           # only judge outputs in the output phase
                 continue
+            in_seq = {self.outputs[d] for d in seq}
             for u in active:
-                credit(list(tags[u]), 1.0 if u in want else -1.0)
+                if u in want:
+                    r = 1.0
+                elif u in in_seq:                  # right digit, wrong place: small positive
+                    r = self.partial
+                else:
+                    r = -1.0
+                credit(list(tags[u]), r)
             for u in want - active:                # missed: blame the unit's own go/read decisions
                 credit([unit_ev[(GO, u)]], -1.0)
                 credit([unit_ev[(READ, u)]], -1.0)
@@ -217,7 +227,7 @@ def train_adaptive(net, length, alpha, T_out=None, T_hi=2.0, T_lo=0.3, lr_hi=0.3
             seq = list(rng.integers(0, alpha, length))
             net.run(seq, grads=(dW, dth))
             s += ema * (max(0.0, float(np.mean(net.disc))) - s)
-        net.W = np.clip(net.W + lr * dW / batch, -2, 2)
+        net.W = np.clip(net.W + lr * dW / batch, -2, 2) * net.mask
         net.th = np.clip(net.th + lr * dth / batch, 0.2, 4.0)
         if (ep + batch) % check == 0:
             net._update_callorder()
