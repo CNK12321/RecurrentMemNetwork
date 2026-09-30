@@ -14,29 +14,60 @@ EMPTY = frozenset()
 
 
 class Net:
-    def __init__(self, hidden=40, T=0.4, seed=0, th0=1.5, use_halt=True):
+    """Layout: inputs -> clusters -> bridge neurons -> outputs (+ halt).
+
+    Each cluster is densely connected inside itself and sparsely (prob `inter`)
+    to the other clusters. Inputs feed every cluster neuron. Only the bridge
+    neurons read from the clusters, and only the bridges feed the output and
+    halt units, so all information to the outputs passes through the bridges.
+    """
+
+    def __init__(self, n_clusters=4, cluster_size=10, n_bridge=8, inter=0.1,
+                 T=0.4, seed=0, th0=1.5, use_halt=True):
+        assert 5 <= n_bridge <= 10
         self.use_halt = use_halt
         self.rng = np.random.default_rng(seed)
         self.T = T
         self.n_in, self.n_out = 11, 10            # inputs: digits 0-9 + "done"
-        self.N = N = self.n_in + hidden + self.n_out + 1
         self.inputs = list(range(self.n_in))
-        self.outputs = list(range(N - 1 - self.n_out, N - 1))
-        self.halt = N - 1
-        self.proc = list(range(self.n_in, N))      # states that run gates
-        self.W = self.rng.uniform(-1, 1, (3, N, N))
-        for g in range(3):
-            np.fill_diagonal(self.W[g], 0)
+        k = self.n_in
+        self.clusters = []
+        for _ in range(n_clusters):
+            self.clusters.append(list(range(k, k + cluster_size)))
+            k += cluster_size
+        self.bridges = list(range(k, k + n_bridge)); k += n_bridge
+        self.outputs = list(range(k, k + self.n_out)); k += self.n_out
+        self.halt = k; self.N = N = k + 1
+        cl_all = [s for c in self.clusters for s in c]
+        self.groups = [cl_all, self.bridges, self.outputs + [self.halt]]   # run order
+        self.proc = [s for g in self.groups for s in g]
+
+        # mask[s, i] = 1 if source i may connect into state s
+        m = np.zeros((N, N))
+        for c in self.clusters:
+            for s in c:
+                m[s, self.inputs] = 1
+                m[s, c] = 1
+                others = [i for i in cl_all if i not in c]
+                m[s, others] = self.rng.random(len(others)) < inter
+        for s in self.bridges:
+            m[s, cl_all] = 1
+        for s in self.outputs + [self.halt]:
+            m[s, self.bridges] = 1
+        np.fill_diagonal(m, 0)
+        self.mask = m
+        self.W = self.rng.uniform(-1, 1, (3, N, N)) * m
         self.th = th0 + self.rng.uniform(-0.3, 0.3, (3, N))
         self._update_callorder()
 
     def _update_callorder(self):
-        # Original idea: states wired from inputs go first, states wired to outputs go last.
-        eff = []
-        for s in self.proc:
-            e = (self.W[GO, s, self.inputs].sum() - self.W[GO, s, self.outputs].sum()) / self.th[GO, s]
-            eff.append(e)
-        self.order = [self.proc[i] for i in np.argsort(eff)[::-1]]
+        # Groups run in order (clusters, bridges, outputs); inside a group, the
+        # state wired most strongly from earlier states / least to later ones goes first.
+        self.order = []
+        for grp in self.groups:
+            eff = [(self.W[GO, s, self.inputs].sum() - self.W[GO, s, self.outputs].sum()) / self.th[GO, s]
+                   for s in grp]
+            self.order += [grp[i] for i in np.argsort(eff)[::-1]]
 
     def _p(self, total, s):
         return 1 / (1 + np.exp(-(total - self.th[:, s]) / self.T))
@@ -140,7 +171,7 @@ def train(net, stages, lr=0.05, batch=8, max_eps=6000, check=500, target=0.9, lo
             for _ in range(batch):
                 seq = list(rng.integers(0, alpha, length))
                 net.run(seq, grads=(dW, dth))
-            net.W = np.clip(net.W + lr * dW / batch, -2, 2)
+            net.W = np.clip(net.W + lr * dW / batch, -2, 2) * net.mask
             net.th = np.clip(net.th + lr * dth / batch, 0.2, 4.0)
             total += batch
             if (ep + batch) % check == 0:
@@ -155,7 +186,6 @@ def train(net, stages, lr=0.05, batch=8, max_eps=6000, check=500, target=0.9, lo
 
 
 if __name__ == "__main__":
-    hidden = int(sys.argv[1]) if len(sys.argv) > 1 else 40
-    net = Net(hidden=hidden, seed=0)
+    net = Net(seed=0)
     stages = [(1, 2), (1, 4), (1, 10), (2, 10), (3, 10)]
     train(net, stages)
